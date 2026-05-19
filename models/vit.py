@@ -36,21 +36,20 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0., use_flash_attention=False):
         super().__init__()
-        inner_dim = dim_head *  heads
+        inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
         self.scale = dim_head ** -0.5
+        self.use_flash_attention = use_flash_attention  # Store the flag
 
         self.norm = nn.LayerNorm(dim)
-
-        # Shouldn't be needed anymore since PyTorch FlashAttention has softmax included
-        # self.attend = nn.Softmax(dim = -1)
+        self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
@@ -59,70 +58,75 @@ class Attention(nn.Module):
         self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
 
     def forward(self, x):
-        (
-            B,
-            T,
-            C,
-        ) = x.size()
+        B, T, C = x.size()
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
 
-        # PyTorch SDPA expects a boolean mask where True = allow attention, False = block.
-        # The original code uses 1s and 0s, so convert it to boolean.
-        attn_mask = self.bias[:, :, :T, :T] == 1
+        if self.use_flash_attention:
+            attn_mask = self.bias[:, :, :T, :T] == 1
+            dropout_p = self.dropout.p if self.training else 0.0
 
-        # Determine the dropout probability based on whether the model is in training mode
-        dropout_p = self.dropout.p if self.training else 0.0
+            out = nn.functional.scaled_dot_product_attention(
+                query=q, key=k, value=v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=False
+            )
+        else:
+            dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+            dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
-        out = nn.functional.scaled_dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=False  # False, because we are supplying our own block-causal mask
-        )
+            attn = self.attend(dots)
+            attn = self.dropout(attn)
+            out = torch.matmul(attn, v)
+
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
+
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0., use_flash_attention=False):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
-                FeedForward(dim, mlp_dim, dropout = dropout)
+                Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout,
+                          use_flash_attention=use_flash_attention),
+                FeedForward(dim, mlp_dim, dropout=dropout)
             ]))
 
     def forward(self, x):
         for attn, ff in self.layers:
             x = attn(x) + x
             x = ff(x) + x
-
         return self.norm(x)
-    
+
+
 class ViTPredictor(nn.Module):
-    def __init__(self, *, num_patches, num_frames, dim, depth, heads, mlp_dim, pool='cls', dim_head=64, dropout=0., emb_dropout=0.):
+    # Added use_flash_attention=False to the signature
+    def __init__(self, *, num_patches, num_frames, dim, depth, heads, mlp_dim, pool='cls', dim_head=64, dropout=0.,
+                 emb_dropout=0., use_flash_attention=False):
         super().__init__()
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
-        
-        # update params for adding causal attention masks
+
         global NUM_FRAMES, NUM_PATCHES
         NUM_FRAMES = num_frames
         NUM_PATCHES = num_patches
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames * (num_patches), dim)) # dim for the pos encodings
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames * (num_patches), dim))
         self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+        # Pass the flag down to the Transformer
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout,
+                                       use_flash_attention=use_flash_attention)
         self.pool = pool
 
-    def forward(self, x): # x: (b, window_size * H/patch_size * W/patch_size, 384)
+    def forward(self, x):
         b, n, _ = x.shape
         x = x + self.pos_embedding[:, :n]
-        x = self.dropout(x) 
-        x = self.transformer(x) 
+        x = self.dropout(x)
+        x = self.transformer(x)
         return x
