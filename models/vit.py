@@ -46,7 +46,8 @@ class Attention(nn.Module):
 
         self.norm = nn.LayerNorm(dim)
 
-        self.attend = nn.Softmax(dim = -1)
+        # Shouldn't be needed anymore since PyTorch FlashAttention has softmax included
+        # self.attend = nn.Softmax(dim = -1)
         self.dropout = nn.Dropout(dropout)
 
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
@@ -68,14 +69,21 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        # apply causal mask
-        dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # PyTorch SDPA expects a boolean mask where True = allow attention, False = block.
+        # The original code uses 1s and 0s, so convert it to boolean.
+        attn_mask = self.bias[:, :, :T, :T] == 1
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
+        # Determine the dropout probability based on whether the model is in training mode
+        dropout_p = self.dropout.p if self.training else 0.0
 
-        out = torch.matmul(attn, v)
+        out = nn.functional.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=False  # False, because we are supplying our own block-causal mask
+        )
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
