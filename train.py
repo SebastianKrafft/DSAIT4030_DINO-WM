@@ -446,13 +446,6 @@ class Trainer:
             obs, act, state = data
             plot = i == 0  # only plot from the first batch
             self.model.train()
-
-            # --- START PROFILING ---
-            torch.cuda.synchronize()
-            step_start = time.time()
-            torch.cuda.reset_peak_memory_stats()
-            # -----------------------
-
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
             )
@@ -474,16 +467,7 @@ class Trainer:
                 self.predictor_optimizer.step()
                 self.action_encoder_optimizer.step()
 
-            # --- END PROFILING ---
-            torch.cuda.synchronize()
-            step_time = time.time() - step_start
-            peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 2)  # Convert bytes to MB
-            # ---------------------
-
             loss = self.accelerator.gather_for_metrics(loss).mean()
-
-            loss_components["step_time_sec"] = torch.tensor(step_time, device=self.device)
-            loss_components["peak_vram_mb"] = torch.tensor(peak_vram, device=self.device)
 
             loss_components = self.accelerator.gather_for_metrics(loss_components)
             loss_components = {
