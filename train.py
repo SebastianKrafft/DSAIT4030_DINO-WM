@@ -244,12 +244,17 @@ class Trainer:
             self.wandb_run.watch(self.proprio_encoder)
 
         # initialize predictor
-        if self.encoder.latent_ndim == 1:  # if feature is 1D
-            num_patches = 1
+        if hasattr(self.datasets["train"], "num_patches"):
+            num_patches = self.datasets["train"].num_patches
         else:
-            decoder_scale = 16  # from vqvae
-            num_side_patches = self.cfg.img_size // decoder_scale
-            num_patches = num_side_patches**2
+            if self.encoder.latent_ndim == 1:  # if feature is 1D
+                num_patches = 1
+            else:
+                decoder_scale = 16  # from vqvae
+                num_side_patches = self.cfg.img_size // decoder_scale
+                num_patches = num_side_patches**2
+
+        visual_emb_dim = getattr(self.datasets["train"], "visual_emb_dim", self.encoder.emb_dim)
 
         if self.cfg.concat_dim == 0:
             num_patches += 2
@@ -260,7 +265,7 @@ class Trainer:
                     self.cfg.predictor,
                     num_patches=num_patches,
                     num_frames=self.cfg.num_hist,
-                    dim=self.encoder.emb_dim
+                    dim=visual_emb_dim
                     + (
                         proprio_emb_dim * self.cfg.num_proprio_repeat
                         + action_emb_dim * self.cfg.num_action_repeat
@@ -287,7 +292,7 @@ class Trainer:
                 else:
                     self.decoder = hydra.utils.instantiate(
                         self.cfg.decoder,
-                        emb_dim=self.encoder.emb_dim,  # 384
+                        emb_dim=visual_emb_dim,
                     )
             if not self.train_decoder:
                 for param in self.decoder.parameters():

@@ -1,0 +1,3 @@
+_target_: models.dummy.DummyPatchEncoder
+emb_dim: 384
+num_patches: 256
