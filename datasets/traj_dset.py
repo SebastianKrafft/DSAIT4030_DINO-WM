@@ -81,6 +81,12 @@ class TrajSlicerDataset(TrajDataset):
             self.action_dim = self.dataset.action_dim
 
         self.state_dim = self.dataset.state_dim
+        if hasattr(self.dataset, "num_patches"):
+            self.num_patches = self.dataset.num_patches
+        if hasattr(self.dataset, "visual_emb_dim"):
+            self.visual_emb_dim = self.dataset.visual_emb_dim
+        if hasattr(self.dataset, "visual_is_embedding"):
+            self.visual_is_embedding = self.dataset.visual_is_embedding
 
 
     def get_seq_length(self, idx: int) -> int:
