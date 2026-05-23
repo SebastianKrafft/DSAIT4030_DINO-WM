@@ -67,3 +67,21 @@ plan_settings:
   goal_source: ['dset', 'random_state']
   goal_H: [5]
   alpha: [0.1, 1]
+
+profiling:
+  # Lightweight epoch metrics are always logged by train.py.
+  # Enable this only for short debug runs; torch.profiler adds overhead and writes traces.
+  torch_profiler: false
+  torch_profiler_epoch: all
+  torch_profiler_dir: profile/torch
+  torch_profiler_skip_first: 0
+  torch_profiler_wait: 8
+  torch_profiler_warmup: 1
+  torch_profiler_active: 5
+  torch_profiler_repeat: 1
+  torch_profiler_record_shapes: true
+  torch_profiler_profile_memory: true
+  torch_profiler_with_stack: false
+  torch_profiler_with_flops: true
+  torch_profiler_row_limit: 20
+

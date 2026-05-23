@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import hydra
 import torch
@@ -14,6 +15,7 @@ from einops import rearrange
 from accelerate import Accelerator
 from torchvision import utils
 import torch.distributed as dist
+from contextlib import nullcontext
 from pathlib import Path
 from collections import OrderedDict
 from hydra.types import RunMode
@@ -68,6 +70,7 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        self._torch_profiler = None
 
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
             "Batch size must be divisible by the number of processes. "
@@ -376,10 +379,46 @@ class Trainer:
         init_epoch = self.epoch + 1  # epoch starts from 1
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
+            self._profile = {"epoch": epoch}
+            cuda_ok = torch.cuda.is_available() and self.device.type == "cuda"
+            if cuda_ok:
+                torch.cuda.reset_peak_memory_stats(self.device)
+
             self.accelerator.wait_for_everyone()
-            self.train()
+            t_train = time.perf_counter()
+            torch_profiler_ctx = self.build_torch_profiler(epoch, cuda_ok)
+            with torch_profiler_ctx as prof:
+                self._torch_profiler = prof
+                try:
+                    self.train()
+                finally:
+                    self._torch_profiler = None
+            if cuda_ok:
+                torch.cuda.synchronize(self.device)
+            self._profile["train_sec"] = time.perf_counter() - t_train
+            self._profile["train_batches"] = len(self.dataloaders["train"])
+            self._profile["train_it_per_sec"] = (
+                self._profile["train_batches"] / max(self._profile["train_sec"], 1e-9)
+            )
+
             self.accelerator.wait_for_everyone()
+            t_val = time.perf_counter()
             self.val()
+            if cuda_ok:
+                torch.cuda.synchronize(self.device)
+            self._profile["val_sec"] = time.perf_counter() - t_val
+            self._profile["val_batches"] = len(self.dataloaders["valid"])
+            self._profile["val_it_per_sec"] = (
+                self._profile["val_batches"] / max(self._profile["val_sec"], 1e-9)
+            )
+
+            self._profile["epoch_sec"] = (
+                self._profile["train_sec"] + self._profile["val_sec"]
+            )
+            if cuda_ok:
+                self._profile["gpu_peak_gib"] = (
+                    torch.cuda.max_memory_allocated(self.device) / 1024**3
+                )
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
@@ -411,6 +450,96 @@ class Trainer:
                     )
                     with lock:
                         self.job_set.update(jobs)
+
+    def cfg_select(self, key, default):
+        return OmegaConf.select(self.cfg, key, default=default)
+
+    def profiler_record(self, name):
+        if self._torch_profiler is None:
+            return nullcontext()
+        return torch.profiler.record_function(name)
+
+    def build_torch_profiler(self, epoch, cuda_ok):
+        if not self.cfg_select("profiling.torch_profiler", False):
+            return nullcontext()
+
+        profile_epoch = self.cfg_select("profiling.torch_profiler_epoch", "all")
+        if str(profile_epoch).lower() not in ("all", "every"):
+            profile_epoch = int(profile_epoch)
+            if epoch != profile_epoch:
+                return nullcontext()
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if cuda_ok:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        trace_root = self.cfg_select("profiling.torch_profiler_dir", "profile/torch")
+        trace_dir = os.path.join(
+            trace_root,
+            f"epoch_{epoch:04d}",
+            f"rank_{self.accelerator.process_index}",
+        )
+        os.makedirs(trace_dir, exist_ok=True)
+
+        wait = int(self.cfg_select("profiling.torch_profiler_wait", 1))
+        warmup = int(self.cfg_select("profiling.torch_profiler_warmup", 1))
+        active = int(self.cfg_select("profiling.torch_profiler_active", 5))
+        repeat = int(self.cfg_select("profiling.torch_profiler_repeat", 1))
+        skip_first = int(self.cfg_select("profiling.torch_profiler_skip_first", 0))
+        row_limit = int(self.cfg_select("profiling.torch_profiler_row_limit", 20))
+        sort_by = "self_cuda_time_total" if cuda_ok else "self_cpu_time_total"
+        tb_handler = torch.profiler.tensorboard_trace_handler(
+            trace_dir, worker_name=f"rank_{self.accelerator.process_index}"
+        )
+
+        def trace_handler(prof):
+            tb_handler(prof)
+            table = prof.key_averages().table(sort_by=sort_by, row_limit=row_limit)
+            summary_path = os.path.join(
+                trace_dir, f"summary_step_{prof.step_num:04d}.txt"
+            )
+            with open(summary_path, "w") as f:
+                f.write(table)
+            if self.accelerator.is_main_process:
+                log.info(
+                    "[torch_profiler] wrote trace and operator summary to %s",
+                    trace_dir,
+                )
+                log.info("\n%s", table)
+
+        self._profile["torch_profiler_dir"] = trace_dir
+        self._profile["torch_profiler_schedule"] = {
+            "skip_first": skip_first,
+            "wait": wait,
+            "warmup": warmup,
+            "active": active,
+            "repeat": repeat,
+        }
+        log.info(
+            "[torch_profiler] profiling epoch %s with traces in %s",
+            epoch,
+            trace_dir,
+        )
+
+        return torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                skip_first=skip_first,
+                wait=wait,
+                warmup=warmup,
+                active=active,
+                repeat=repeat,
+            ),
+            on_trace_ready=trace_handler,
+            record_shapes=bool(
+                self.cfg_select("profiling.torch_profiler_record_shapes", True)
+            ),
+            profile_memory=bool(
+                self.cfg_select("profiling.torch_profiler_profile_memory", True)
+            ),
+            with_stack=bool(self.cfg_select("profiling.torch_profiler_with_stack", False)),
+            with_flops=bool(self.cfg_select("profiling.torch_profiler_with_flops", True)),
+        )
 
     def err_eval_single(self, z_pred, z_tgt):
         logs = {}
@@ -448,96 +577,125 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
-            obs, act, state = data
-            plot = i == 0  # only plot from the first batch
-            self.model.train()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
+            with self.profiler_record("train/batch"):
+                obs, act, state = data
+                plot = i == 0  # only plot from the first batch
+                self.model.train()
+                with self.profiler_record("train/forward"):
+                    (
+                        z_out,
+                        visual_out,
+                        visual_reconstructed,
+                        loss,
+                        loss_components,
+                    ) = self.model(obs, act)
 
-            self.encoder_optimizer.zero_grad()
-            if self.cfg.has_decoder:
-                self.decoder_optimizer.zero_grad()
-            if self.cfg.has_predictor:
-                self.predictor_optimizer.zero_grad()
-                self.action_encoder_optimizer.zero_grad()
+                with self.profiler_record("train/zero_grad"):
+                    self.encoder_optimizer.zero_grad()
+                    if self.cfg.has_decoder:
+                        self.decoder_optimizer.zero_grad()
+                    if self.cfg.has_predictor:
+                        self.predictor_optimizer.zero_grad()
+                        self.action_encoder_optimizer.zero_grad()
 
-            self.accelerator.backward(loss)
+                with self.profiler_record("train/backward"):
+                    self.accelerator.backward(loss)
 
-            if self.model.train_encoder:
-                self.encoder_optimizer.step()
-            if self.cfg.has_decoder and self.model.train_decoder:
-                self.decoder_optimizer.step()
-            if self.cfg.has_predictor and self.model.train_predictor:
-                self.predictor_optimizer.step()
-                self.action_encoder_optimizer.step()
+                with self.profiler_record("train/optimizer_step"):
+                    if self.model.train_encoder:
+                        self.encoder_optimizer.step()
+                    if self.cfg.has_decoder and self.model.train_decoder:
+                        self.decoder_optimizer.step()
+                    if self.cfg.has_predictor and self.model.train_predictor:
+                        self.predictor_optimizer.step()
+                        self.action_encoder_optimizer.step()
 
-            loss = self.accelerator.gather_for_metrics(loss).mean()
+                with self.profiler_record("train/metrics_and_logging"):
+                    loss = self.accelerator.gather_for_metrics(loss).mean()
 
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
-            loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
-            }
-            if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
+                    loss_components = self.accelerator.gather_for_metrics(
+                        loss_components
+                    )
+                    loss_components = {
+                        key: value.mean().item()
+                        for key, value in loss_components.items()
                     }
-                    err_logs = {f"train_{k}": [v] for k, v in err_logs.items()}
+                    if self.cfg.has_decoder and plot:
+                        # only eval images when plotting due to speed
+                        if self.cfg.has_predictor:
+                            z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                            z_gt = self.model.encode_obs(obs)
+                            z_tgt = slice_trajdict_with_t(
+                                z_gt, start_idx=self.model.num_pred
+                            )
 
-                    self.logs_update(err_logs)
+                            state_tgt = state[
+                                :, -self.model.num_hist :
+                            ]  # (b, num_hist, dim)
+                            err_logs = self.err_eval(z_obs_out, z_tgt)
 
-                if visual_out is not None:
-                    for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
-                    ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                            err_logs = self.accelerator.gather_for_metrics(err_logs)
+                            err_logs = {
+                                key: value.mean().item()
+                                for key, value in err_logs.items()
+                            }
+                            err_logs = {
+                                f"train_{k}": [v] for k, v in err_logs.items()
+                            }
+
+                            self.logs_update(err_logs)
+
+                        if visual_out is not None:
+                            for t in range(
+                                self.cfg.num_hist,
+                                self.cfg.num_hist + self.cfg.num_pred,
+                            ):
+                                img_pred_scores = eval_images(
+                                    visual_out[:, t - self.cfg.num_pred],
+                                    obs["visual"][:, t],
+                                )
+                                img_pred_scores = self.accelerator.gather_for_metrics(
+                                    img_pred_scores
+                                )
+                                img_pred_scores = {
+                                    f"train_img_{k}_pred": [v.mean().item()]
+                                    for k, v in img_pred_scores.items()
+                                }
+                                self.logs_update(img_pred_scores)
+
+                        if visual_reconstructed is not None:
+                            for t in range(obs["visual"].shape[1]):
+                                img_reconstruction_scores = eval_images(
+                                    visual_reconstructed[:, t], obs["visual"][:, t]
+                                )
+                                img_reconstruction_scores = (
+                                    self.accelerator.gather_for_metrics(
+                                        img_reconstruction_scores
+                                    )
+                                )
+                                img_reconstruction_scores = {
+                                    f"train_img_{k}_reconstructed": [v.mean().item()]
+                                    for k, v in img_reconstruction_scores.items()
+                                }
+                                self.logs_update(img_reconstruction_scores)
+
+                        self.plot_samples(
+                            obs["visual"],
+                            visual_out,
+                            visual_reconstructed,
+                            self.epoch,
+                            batch=i,
+                            num_samples=self.num_reconstruct_samples,
+                            phase="train",
                         )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
-                        )
-                        img_pred_scores = {
-                            f"train_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
-                        }
-                        self.logs_update(img_pred_scores)
 
-                if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
-                        )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
-                        )
-                        img_reconstruction_scores = {
-                            f"train_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
-                        }
-                        self.logs_update(img_reconstruction_scores)
+                    loss_components = {
+                        f"train_{k}": [v] for k, v in loss_components.items()
+                    }
+                    self.logs_update(loss_components)
 
-                self.plot_samples(
-                    obs["visual"],
-                    visual_out,
-                    visual_reconstructed,
-                    self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="train",
-                )
-
-            loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
+            if self._torch_profiler is not None:
+                self._torch_profiler.step()
 
     def val(self):
         self.model.eval()
@@ -744,6 +902,30 @@ class Trainer:
         epoch_log["epoch"] = step
         log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
                 Validation loss: {epoch_log['val_loss']:.4f}")
+
+        prof = getattr(self, "_profile", None)
+        if prof:
+            for k, v in prof.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    epoch_log[f"profile/{k}"] = v
+            gpu_str = (
+                f"  gpu_peak={prof['gpu_peak_gib']:.2f}GiB"
+                if "gpu_peak_gib" in prof
+                else ""
+            )
+            log.info(
+                f"[profile] epoch {prof['epoch']}: "
+                f"total={prof['epoch_sec']:.1f}s  "
+                f"train={prof['train_sec']:.1f}s ({prof['train_it_per_sec']:.2f} it/s, "
+                f"{prof['train_batches']} batches)  "
+                f"val={prof['val_sec']:.1f}s ({prof['val_it_per_sec']:.2f} it/s, "
+                f"{prof['val_batches']} batches)"
+                f"{gpu_str}"
+            )
+            if self.accelerator.is_main_process:
+                os.makedirs("profile", exist_ok=True)
+                with open(f"profile/epoch_{prof['epoch']:04d}.json", "w") as f:
+                    json.dump(prof, f, indent=2)
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(epoch_log)
