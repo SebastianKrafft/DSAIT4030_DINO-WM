@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - env: point_maze
-  - encoder: dino 
+  - encoder: precomputed
   - action_encoder: proprio
   - proprio_encoder: proprio
   - decoder: vqvae
@@ -46,7 +46,7 @@ num_proprio_repeat: 1
 num_hist: 3
 num_pred: 1 # only supports 1
 has_predictor: True # set this to False for only training a decoder
-has_decoder: False # set this to False for only training a predictor
+has_decoder: False # point-maze uses precomputed visual embeddings and skips image reconstruction
 
 model:
   _target_: models.visual_world_model.VWorldModel

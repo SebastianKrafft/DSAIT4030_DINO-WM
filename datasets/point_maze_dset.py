@@ -2,11 +2,8 @@ import torch
 import decord
 import numpy as np
 from pathlib import Path
-from einops import rearrange
-from decord import VideoReader
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, get_train_val_sliced
-from typing import Optional, Callable, Any
 decord.bridge.set_bridge("torch")
 
 class PointMazeDataset(TrajDataset):
@@ -17,10 +14,12 @@ class PointMazeDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
         action_scale=1.0,
+        embedding_dir: Optional[str] = None,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
         self.normalize_action = normalize_action
+        self.embedding_dir = Path(embedding_dir) if embedding_dir is not None else self.data_path
         states = torch.load(self.data_path / "states.pth").float()
         self.states = states
         self.actions = torch.load(self.data_path / "actions.pth").float()
@@ -42,6 +41,15 @@ class PointMazeDataset(TrajDataset):
         self.action_dim = self.actions.shape[-1]
         self.state_dim = self.states.shape[-1]
         self.proprio_dim = self.proprios.shape[-1]
+        self.visual_is_embedding = True
+
+        sample_embedding = self._load_episode_embeddings(0)
+        if sample_embedding.ndim != 3:
+            raise ValueError(
+                f"Expected point maze visual embeddings with shape (T, P, D), got {tuple(sample_embedding.shape)}"
+            )
+        self.num_patches = sample_embedding.shape[1]
+        self.visual_emb_dim = sample_embedding.shape[2]
 
         if normalize_action:
             self.action_mean, self.action_std = self.get_data_mean_std(self.actions, self.seq_lengths)
@@ -79,20 +87,20 @@ class PointMazeDataset(TrajDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    def _load_episode_embeddings(self, idx):
+        emb_path = self.embedding_dir / f"patched_ep{idx:03d}.pt"
+        emb = torch.load(emb_path).float()
+        return emb
+
     def get_frames(self, idx, frames):
-        obs_dir = self.data_path / "obses"
-        image = torch.load(obs_dir / f"episode_{idx:03d}.pth")
+        visual = self._load_episode_embeddings(idx)
         proprio = self.proprios[idx, frames]
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
 
-        image = image[frames]  # THWC
-        image = image / 255.0
-        image = rearrange(image, "T H W C -> T C H W")
-        if self.transform:
-            image = self.transform(image)
+        visual = visual[frames]
         obs = {
-            "visual": image,
+            "visual": visual,
             "proprio": proprio
         }
         return obs, act, state, {} # env_info
@@ -107,7 +115,7 @@ class PointMazeDataset(TrajDataset):
         if isinstance(imgs, np.ndarray):
             raise NotImplementedError
         elif isinstance(imgs, torch.Tensor):
-            return rearrange(imgs, "b h w c -> b c h w") / 255.0
+            return imgs.float()
         
 def load_point_maze_slice_train_val(
     transform,
@@ -118,12 +126,14 @@ def load_point_maze_slice_train_val(
     num_hist=0,
     num_pred=0,
     frameskip=0,
+    embedding_dir=None,
 ):
     dset = PointMazeDataset(
         n_rollout=n_rollout,
         transform=transform,
         data_path=data_path,
         normalize_action=normalize_action,
+        embedding_dir=embedding_dir,
     )
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset, 
