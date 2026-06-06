@@ -37,6 +37,8 @@ class Trainer:
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("outputs/")[-1]
         model_name += f"_{self.cfg.env.name}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
+        
+        self.best_val_loss = float('inf')
 
         if HydraConfig.get().mode == RunMode.MULTIRUN:
             log.info(" Multirun setup begin...")
@@ -188,7 +190,7 @@ class Trainer:
                 else:
                     ckpt[k] = self.__dict__[k]
             torch.save(ckpt, "checkpoints/model_latest.pth")
-            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+            # torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
             log.info("Saved model to {}".format(os.getcwd()))
             ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
         else:
@@ -902,6 +904,22 @@ class Trainer:
         epoch_log["epoch"] = step
         log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
                 Validation loss: {epoch_log['val_loss']:.4f}")
+
+        # ── ADD THIS BLOCK ──
+        if self.accelerator.is_main_process:
+            current_val_loss = epoch_log.get('val_loss', float('inf'))
+            if current_val_loss < self.best_val_loss:
+                self.best_val_loss = current_val_loss
+                ckpt = {}
+                for k in self._keys_to_save:
+                    if hasattr(self.__dict__[k], "module"):
+                        ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
+                    else:
+                        ckpt[k] = self.__dict__[k]
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save(ckpt, "checkpoints/model_best.pth")
+                log.info(f"New best model at epoch {self.epoch} val_loss={current_val_loss:.4f}")
+        # ── END ADD ──
 
         prof = getattr(self, "_profile", None)
         if prof:
