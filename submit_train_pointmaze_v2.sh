@@ -6,11 +6,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=6
 #SBATCH --gpus-per-task=1
-#SBATCH --mem-per-cpu=4G
+#SBATCH --mem-per-cpu=6G
 #SBATCH --output=/home/%u/dino_wm_logs/train_v2_%j.out
 #SBATCH --error=/home/%u/dino_wm_logs/train_v2_%j.err
 
-mkdir -p ~/dino_wm_logs ~/dino_wm_checkpoints/dino_pointmaze_v2
+mkdir -p ~/dino_wm_logs
+mkdir -p ~/dino_wm_checkpoints/dino_v2_full_training
 
 echo "=============================="
 echo "Job started: $(date)"
@@ -52,10 +53,11 @@ python train.py \
 	num_hist=3 \
 	training.batch_size=32 \
 	has_decoder=False \
-	training.epochs=50 \
-	training.save_every_x_epoch=50 \
+	training.epochs=100 \
+	training.save_every_x_epoch=1 \
 	predictor.use_flash_attention=true \
-	ckpt_base_path=/home/$USER/dino_wm_checkpoints/dino_pointmaze_v2
+	ckpt_base_path=/home/$USER/dino_wm_checkpoints/dino_v2_full_training \
+	hydra.run.dir=/home/$USER/dino_wm_checkpoints/dino_v2_full_training
 
 echo "=============================="
 echo "Job finished: $(date)"
