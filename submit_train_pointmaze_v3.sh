@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=dino_pointmaze_v3_model
+#SBATCH --job-name=dino_pointmaze_v3_model_v100_withflash_cont
 #SBATCH --account=education-me-msc-ro
-#SBATCH --partition=gpu-a100
-#SBATCH --time=04:00:00
+#SBATCH --partition=gpu-v100
+#SBATCH --time=10:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=6
 #SBATCH --gpus-per-task=1
-#SBATCH --mem-per-cpu=6G
-#SBATCH --output=/home/%u/dino_wm_logs/train_v3_%j.out
-#SBATCH --error=/home/%u/dino_wm_logs/train_v3_%j.err
+#SBATCH --mem-per-cpu=5G
+#SBATCH --output=/home/%u/dino_wm_logs/train_v3_withflash_cont_%j.out
+#SBATCH --error=/home/%u/dino_wm_logs/train_v3_withflash_cont_%j.err
 
 mkdir -p ~/dino_wm_logs
-mkdir -p ~/dino_wm_checkpoints/dino_v3_full_training
+mkdir -p ~/dino_wm_checkpoints/dino_v3_full_training_withflash
 
 echo "=============================="
 echo "Job started: $(date)"
