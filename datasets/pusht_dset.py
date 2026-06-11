@@ -1,11 +1,11 @@
 import torch
-import decord
+#import decord
 import pickle
 import numpy as np
 from pathlib import Path
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, TrajSlicerDataset
-decord.bridge.set_bridge("torch")
+# decord.bridge.set_bridge("torch")
 
 # precomputed dataset stats
 ACTION_MEAN = torch.tensor([-0.0087, 0.0068])
@@ -32,12 +32,12 @@ class PushTDataset(TrajDataset):
         self.relative = relative
         self.normalize_action = normalize_action
         self.embedding_dir = Path(embedding_dir) if embedding_dir is not None else self.data_path
-        self.states = torch.load(self.data_path / "states.pth")
+        self.states = torch.load(self.data_path / "states.pth", weights_only=False)
         self.states = self.states.float()
         if relative:
-            self.actions = torch.load(self.data_path / "rel_actions.pth")
+            self.actions = torch.load(self.data_path / "rel_actions.pth", weights_only=False)
         else:
-            self.actions = torch.load(self.data_path / "abs_actions.pth")
+            self.actions = torch.load(self.data_path / "abs_actions.pth", weights_only=False)
         self.actions = self.actions.float()
         self.actions = self.actions / action_scale  # scaled back up in env
 
@@ -66,7 +66,7 @@ class PushTDataset(TrajDataset):
         # load velocities and update states and proprios
         self.with_velocity = with_velocity
         if with_velocity:
-            self.velocities = torch.load(self.data_path / "velocities.pth")
+            self.velocities = torch.load(self.data_path / "velocities.pth", weights_only=False)
             self.velocities = self.velocities[:n].float()
             self.states = torch.cat([self.states, self.velocities], dim=-1)
             self.proprios = torch.cat([self.proprios, self.velocities], dim=-1)
@@ -114,8 +114,8 @@ class PushTDataset(TrajDataset):
         return torch.cat(result, dim=0)
 
     def _load_episode_embeddings(self, idx):
-        emb_path = self.embedding_dir / f"patched_ep{idx:03d}.pt"
-        emb = torch.load(emb_path).float()
+        emb_path = self.embedding_dir / f"patched_ep{idx:05d}.pt"
+        emb = torch.load(emb_path, weights_only=False).float()
         return emb
 
     def get_frames(self, idx, frames):
