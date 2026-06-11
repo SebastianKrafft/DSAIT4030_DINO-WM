@@ -125,7 +125,15 @@ class PushTDataset(TrajDataset):
         shape = self.shapes[idx]
 
         visual = self._load_episode_embeddings(idx)
-        visual = visual[frames]
+
+        # --- NEW LAZY FIX ---
+        # Clamp requested frames so they never exceed the actual visual length
+        # If the physics asks for frame 93 but video stops at 92, this safely repeats frame 92.
+        frames_tensor = torch.tensor(frames, dtype=torch.long)
+        frames_tensor = torch.clamp(frames_tensor, max=visual.shape[0] - 1)
+        visual = visual[frames_tensor]
+        # --------------------
+        
         obs = {"visual": visual, "proprio": proprio}
         return obs, act, state, {'shape': shape}
 
