@@ -56,6 +56,7 @@ class MPCPlanner(BasePlanner):
         self.action_len = None  # keep track of the step each traj reaches success
         self.iter = 0
         self.planned_actions = []
+        self.planning_timings = []
 
     def _apply_success_mask(self, actions):
         device = actions.device
@@ -89,9 +90,16 @@ class MPCPlanner(BasePlanner):
                 obs_g=obs_g,
                 actions=memo_actions,
             )  # (b, t, act_dim)
-            taken_actions = actions.detach()[:, : self.n_taken_actions]
+            if self.sub_planner.last_timing is not None:
+                self.planning_timings.append(
+                    {
+                        "mpc_iteration": self.iter + 1,
+                        **self.sub_planner.last_timing,
+                    }
+                )
+            taken_actions = actions.detach().clone()[:, : self.n_taken_actions]
             self._apply_success_mask(taken_actions)
-            memo_actions = actions.detach()[:, self.n_taken_actions :]
+            memo_actions = actions.detach().clone()[:, self.n_taken_actions :]
             self.planned_actions.append(taken_actions)
 
             print(f"MPC iter {self.iter} Eval ------- ")

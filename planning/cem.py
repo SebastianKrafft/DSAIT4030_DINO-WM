@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import time
 from einops import rearrange, repeat
 from .base_planner import BasePlanner
 from utils import move_to_device
@@ -22,6 +23,7 @@ class CEMPlanner(BasePlanner):
         wandb_run,
         logging_prefix="plan_0",
         log_filename="logs.json",
+        sample_batch_size=None,
         **kwargs,
     ):
         super().__init__(
@@ -39,7 +41,9 @@ class CEMPlanner(BasePlanner):
         self.var_scale = var_scale
         self.opt_steps = opt_steps
         self.eval_every = eval_every
+        self.sample_batch_size = sample_batch_size or num_samples
         self.logging_prefix = logging_prefix
+        self.last_timing = None
 
     def init_mu_sigma(self, obs_0, actions=None):
         """
@@ -61,6 +65,7 @@ class CEMPlanner(BasePlanner):
             mu = torch.cat([mu, new_mu.to(device)], dim=1)
         return mu, sigma
 
+    @torch.inference_mode()
     def plan(self, obs_0, obs_g, actions=None):
         """
         Args:
@@ -79,23 +84,17 @@ class CEMPlanner(BasePlanner):
         mu, sigma = self.init_mu_sigma(obs_0, actions)
         mu, sigma = mu.to(self.device), sigma.to(self.device)
         n_evals = mu.shape[0]
+        planning_seconds = 0.0
+        completed_opt_steps = 0
 
         for i in range(self.opt_steps):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            planning_start = time.perf_counter()
+
             # optimize individual instances
             losses = []
             for traj in range(n_evals):
-                cur_trans_obs_0 = {
-                    key: repeat(
-                        arr[traj].unsqueeze(0), "1 ... -> n ...", n=self.num_samples
-                    )
-                    for key, arr in trans_obs_0.items()
-                }
-                cur_z_obs_g = {
-                    key: repeat(
-                        arr[traj].unsqueeze(0), "1 ... -> n ...", n=self.num_samples
-                    )
-                    for key, arr in z_obs_g.items()
-                }
                 action = (
                     torch.randn(self.num_samples, self.horizon, self.action_dim).to(
                         self.device
@@ -104,18 +103,40 @@ class CEMPlanner(BasePlanner):
                     + mu[traj]
                 )
                 action[0] = mu[traj]  # optional: make the first one mu itself
-                with torch.no_grad():
-                    i_z_obses, i_zs = self.wm.rollout(
-                        obs_0=cur_trans_obs_0,
-                        act=action,
-                    )
+                loss_chunks = []
+                for start in range(0, self.num_samples, self.sample_batch_size):
+                    end = min(start + self.sample_batch_size, self.num_samples)
+                    chunk_size = end - start
+                    cur_trans_obs_0 = {
+                        key: repeat(
+                            arr[traj].unsqueeze(0), "1 ... -> n ...", n=chunk_size
+                        )
+                        for key, arr in trans_obs_0.items()
+                    }
+                    cur_z_obs_g = {
+                        key: repeat(
+                            arr[traj].unsqueeze(0), "1 ... -> n ...", n=chunk_size
+                        )
+                        for key, arr in z_obs_g.items()
+                    }
+                    with torch.no_grad():
+                        i_z_obses, _ = self.wm.rollout(
+                            obs_0=cur_trans_obs_0,
+                            act=action[start:end],
+                        )
+                    loss_chunks.append(self.objective_fn(i_z_obses, cur_z_obs_g))
 
-                loss = self.objective_fn(i_z_obses, cur_z_obs_g)
+                loss = torch.cat(loss_chunks)
                 topk_idx = torch.argsort(loss)[: self.topk]
                 topk_action = action[topk_idx]
                 losses.append(loss[topk_idx[0]].item())
                 mu[traj] = topk_action.mean(dim=0)
                 sigma[traj] = topk_action.std(dim=0)
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            planning_seconds += time.perf_counter() - planning_start
+            completed_opt_steps = i + 1
 
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": np.mean(losses), "step": i + 1}
@@ -131,4 +152,13 @@ class CEMPlanner(BasePlanner):
                 if np.all(successes):
                     break  # terminate planning if all success
 
+        self.last_timing = {
+            "total_seconds": planning_seconds,
+            "seconds_per_evaluation": planning_seconds / n_evals,
+            "n_evaluations": n_evals,
+            "num_samples": self.num_samples,
+            "optimization_steps": completed_opt_steps,
+            "configured_optimization_steps": self.opt_steps,
+            "sample_batch_size": self.sample_batch_size,
+        }
         return mu, np.full(n_evals, np.inf)  # all actions are valid

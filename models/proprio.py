@@ -63,6 +63,8 @@ class ProprioceptiveEmbedding(nn.Module):
 
     def forward(self, x):
         # x: proprioceptive vectors of shape [B T D]
+        if isinstance(self.patch_embed, nn.Linear):
+            return self.patch_embed(x)
         x = x.permute(0, 2, 1)
         x = self.patch_embed(x)
         x = x.permute(0, 2, 1)

@@ -1,154 +1,481 @@
-# Running DINO-WM Inference on PointMaze
+# Running DINO-WM Planning Inference
 
-This guide explains how to download the pretrained checkpoint, configure the planner, and run inference locally on a single GPU.
+This guide covers:
 
----
+- PointMaze inference with the official pretrained checkpoint.
+- PointMaze inference with locally trained DINOv2 or DINOv3 checkpoints.
+- Reproducing the paper's PointMaze planning parameters.
+- Collecting success, distance, video, and runtime measurements.
+- Adapting the same workflow to PushT.
 
-## 1. Download the Pretrained Checkpoint
+All commands should be run from the repository root.
 
-The official DINO-WM checkpoints (PointMaze, PushT, Wall) are hosted on OSF:
+## 1. What Planning Inference Requires
 
-**URL:** https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28
+Planning uses the following components:
 
-Under the `checkpoints/` folder, download **`outputs.zip`** (~908 MB).
+1. A trained world-model predictor checkpoint.
+2. The matching training `hydra.yaml`.
+3. The corresponding frozen visual encoder, such as DINOv2 or DINOv3.
+4. The environment dataset, which supplies validation trajectories,
+   normalization statistics, and dataset goals when required.
+5. The environment simulator.
 
-Then extract only the PointMaze checkpoint into the repo (skip the other models and the `__MACOSX` junk):
+Precomputed training embeddings are **not required** for online planning.
+Planning renders observations and computes their visual features using the
+encoder. If a checkpoint does not contain the frozen encoder weights,
+`plan.py` instantiates the encoder described by its `hydra.yaml`.
+
+## 2. Checkpoint Layout
+
+`plan.py` expects this structure:
+
+```text
+<ckpt_base_path>/
+└── outputs/
+    └── <model_name>/
+        ├── hydra.yaml
+        └── checkpoints/
+            └── model_latest.pth
+```
+
+`model_name` is the directory name inside `outputs/`, not the checkpoint
+filename.
+
+### Official checkpoints
+
+The official DINO-WM checkpoints are available at:
+
+https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28
+
+For PointMaze:
 
 ```bash
-cd /path/to/DSAIT4030_DINO-WM
 mkdir -p pretrained_ckpts
 unzip /path/to/outputs.zip "outputs/point_maze/*" -d pretrained_ckpts/
 ```
 
-After extraction you should have:
+Expected files:
 
+```text
+pretrained_ckpts/outputs/point_maze/hydra.yaml
+pretrained_ckpts/outputs/point_maze/checkpoints/model_latest.pth
 ```
-pretrained_ckpts/
+
+For PushT, extract `outputs/pusht/*` instead.
+
+### Locally trained checkpoints
+
+A locally trained checkpoint must be placed or linked into the same layout.
+Its `hydra.yaml` must describe the environment, dataset, visual encoder,
+predictor architecture, frameskip, action/proprio encoders, and whether a
+decoder exists.
+
+Example:
+
+```text
+our_ckpts/
+├── dinov2_model_best.pth
 └── outputs/
-    └── point_maze/
-        ├── checkpoints/
-        │   └── model_latest.pth    ← the model weights
-        └── hydra.yaml              ← the training config (read by plan.py)
+    └── our_dinov2/
+        ├── hydra.yaml
+        └── checkpoints/
+            └── model_latest.pth -> ../../../dinov2_model_best.pth
 ```
 
----
+Do not use a PointMaze checkpoint for PushT. Action dimensions, proprioception,
+dataset preprocessing, environment dynamics, and predictor training must match
+the target environment.
 
-## 2. Prerequisites
+## 3. Environment Setup
 
-### Mujoco
-Mujoco 2.1 must be installed and on your `LD_LIBRARY_PATH`:
-
-```bash
-mkdir -p ~/.mujoco
-wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -P ~/.mujoco/
-cd ~/.mujoco && tar -xzvf mujoco210-linux-x86_64.tar.gz
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mujoco210/bin:/usr/lib/nvidia
-```
-
-### mujoco_py system headers (Linux)
-`mujoco_py` requires X11 and GL development headers to compile. Install them once:
-
-```bash
-sudo apt-get install -y libx11-dev libgl1-mesa-dev libglew-dev libglfw3-dev libosmesa6-dev patchelf
-```
-
-Then verify mujoco_py compiles:
+Activate the project environment:
 
 ```bash
 conda activate dino_wm
-python -c "import mujoco_py; print('OK', mujoco_py.__version__)"
 ```
 
-### Dataset (for dataset-based goal sampling only)
-If using `goal_source: dset` you also need the PointMaze dataset at `$DATASET_DIR/point_maze/`. For `goal_source: random_state` (the default below) the dataset is still loaded for normalisation stats — so it must be present either way.
+### Dataset
+
+Set `DATASET_DIR` to the parent directory containing the environment data:
 
 ```bash
-export DATASET_DIR=/path/to/data   # must contain point_maze/
+export DATASET_DIR=/absolute/path/to/data
 ```
 
----
+The checkpoint's `hydra.yaml` determines the exact subdirectory. In the
+repository configs these are normally:
 
-## 3. Configure `conf/plan_local.yaml`
-
-Open `conf/plan_local.yaml` and set **`ckpt_base_path`** to the absolute path of the `pretrained_ckpts/` folder you created in step 1:
-
-```yaml
-ckpt_base_path: /absolute/path/to/DSAIT4030_DINO-WM/pretrained_ckpts
+```text
+$DATASET_DIR/point_maze
+$DATASET_DIR/pusht_noise
 ```
 
-> **Important:** this must be an absolute path. Hydra changes the working directory at runtime, so relative paths will not resolve correctly.
+The dataset is still required for `goal_source=random_state` because planning
+loads normalization statistics and validation data.
 
-The other values you may want to adjust:
+### MuJoCo for PointMaze
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `model_name` | `point_maze` | Subfolder inside `ckpt_base_path/outputs/` |
-| `model_epoch` | `latest` | `latest` loads `model_latest.pth`; set to an int for a specific epoch |
-| `n_evals` | `3` | Number of episodes to evaluate |
-| `goal_source` | `random_state` | `random_state` = random goals; `dset` = goals from dataset |
-| `goal_H` | `5` | Steps ahead the goal is sampled from (for `dset` mode) |
-| `n_plot_samples` | `3` | How many episodes to save as plots/videos |
-| `planner.sub_planner.num_samples` | `100` | CEM candidate trajectories per step (reduce if OOM) |
-| `planner.sub_planner.opt_steps` | `5` | CEM optimisation iterations per MPC step (reduce if OOM) |
-
-### GPU memory note
-The full paper config uses `num_samples: 300` and `opt_steps: 10`. On an 8 GB GPU use `num_samples: 100` and `opt_steps: 5` (already set as the default here) to avoid OOM.
-
----
-
-## 4. Run Inference
+PointMaze requires MuJoCo 2.1 and `mujoco_py`:
 
 ```bash
-cd /path/to/DSAIT4030_DINO-WM
-conda activate dino_wm
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia"
+python -c "import mujoco_py; print('mujoco_py OK')"
+```
 
-export DATASET_DIR=/path/to/data
+On the 8 GB laptop GPU, force MuJoCo rendering onto the CPU. Otherwise, one
+GPU renderer per evaluation environment can consume most GPU memory:
+
+```bash
+export MUJOCO_PY_FORCE_CPU=1
+```
+
+### Common runtime variables
+
+```bash
+export DATASET_DIR=/absolute/path/to/data
 export WANDB_MODE=offline
-export DISPLAY=:1    # set to your active X display (check with: echo $DISPLAY)
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mujoco210/bin:/usr/lib/nvidia
+export DISPLAY=:1
+export MUJOCO_PY_FORCE_CPU=1
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export D4RL_SUPPRESS_IMPORT_ERROR=1
-
-python plan.py --config-name plan_local.yaml
 ```
 
----
+Use the active display returned by `echo $DISPLAY` if it is not `:1`.
 
-## 5. Outputs
+## 4. PointMaze Paper Parameters
 
-Results are saved to a timestamped folder under `plan_outputs/`:
+The PointMaze paper configuration is encoded in
+`conf/plan_point_maze.yaml`:
 
+| Parameter | Paper configuration |
+|---|---:|
+| Seed | 99 |
+| Evaluation tasks | 50 |
+| Goal source | `random_state` |
+| Goal horizon | 5 |
+| Planner | MPC with CEM |
+| Planning horizon | 5 |
+| Actions executed per MPC round | 5 |
+| CEM samples per task and optimization step | 300 |
+| CEM top-k | 30 |
+| CEM optimization steps | 10 |
+| Objective alpha | 0 |
+| Objective mode | `last` |
+
+The 50 evaluations are 50 distinct start/goal tasks. For every task and every
+CEM optimization step, the planner evaluates 300 candidate action sequences.
+One MPC round therefore evaluates:
+
+```text
+50 tasks x 300 candidates x 10 optimization steps
+= 150,000 candidate action sequences
 ```
-plan_outputs/<timestamp>_point_maze_gH5/
-├── output_final.png          ← side-by-side: real rollout vs world model prediction
-├── output_final_0_success.mp4  ← video of episode 0 (maze navigation)
-├── output_final_1_success.mp4
-├── output_final_2_success.mp4
-├── plan0.png / plan1.png     ← per-MPC-step trajectory comparisons
-├── plan0_*.mp4               ← videos per MPC round
-└── logs.json                 ← all metrics (success_rate, state_dist, visual_dist)
+
+Each candidate has a horizon of five model actions.
+
+The paper reports PointMaze success rates of:
+
+| Planner | Paper success rate |
+|---|---:|
+| Open-loop CEM | 0.80 |
+| MPC with CEM | 0.98 |
+
+The paper does not report the repository's auxiliary state, visual, proprio,
+or prediction-divergence metrics.
+
+### Memory batching does not change CEM parameters
+
+`sample_batch_size` only controls how many of the 300 candidates are processed
+on the GPU simultaneously. All 300 candidates are still generated and one
+global top-30 selection is performed.
+
+On the RTX 5070 Laptop 8 GB, use:
+
+```text
+planner.sub_planner.sample_batch_size=10
 ```
 
-Open a video to see the robot navigating the maze:
+This preserves the paper's 300 samples, top-30, and 10 optimization steps.
+Larger GPUs may omit this override or use a larger batch.
+
+## 5. Run PointMaze
+
+The local commands below use `plan_local.yaml` to avoid the SLURM launcher in
+`plan_point_maze.yaml`, then override it with the paper parameters.
+
+### Official pretrained checkpoint
 
 ```bash
-xdg-open plan_outputs/<timestamp>_point_maze_gH5/output_final_0_success.mp4
+python plan.py --config-name plan_local.yaml \
+  hydra.run.dir=plan_outputs/pretrained_model \
+  ckpt_base_path=/absolute/path/to/DSAIT4030_DINO-WM/pretrained_ckpts \
+  model_name=point_maze \
+  seed=99 \
+  n_evals=50 \
+  goal_source=random_state \
+  goal_H=5 \
+  n_plot_samples=10 \
+  objective.alpha=0 \
+  objective.mode=last \
+  planner.n_taken_actions=5 \
+  planner.sub_planner.horizon=5 \
+  planner.sub_planner.num_samples=300 \
+  planner.sub_planner.topk=30 \
+  planner.sub_planner.opt_steps=10 \
+  planner.sub_planner.sample_batch_size=10
 ```
 
-Key metrics in `logs.json`:
+### Locally trained DINOv2 checkpoint
+
+Only the checkpoint root and model name change:
+
+```bash
+python plan.py --config-name plan_local.yaml \
+  hydra.run.dir=plan_outputs/our_dinov2 \
+  ckpt_base_path=/absolute/path/to/DSAIT4030_DINO-WM/our_ckpts \
+  model_name=our_dinov2 \
+  seed=99 n_evals=50 goal_source=random_state goal_H=5 \
+  n_plot_samples=10 objective.alpha=0 objective.mode=last \
+  planner.n_taken_actions=5 \
+  planner.sub_planner.horizon=5 \
+  planner.sub_planner.num_samples=300 \
+  planner.sub_planner.topk=30 \
+  planner.sub_planner.opt_steps=10 \
+  planner.sub_planner.sample_batch_size=10
+```
+
+For DINOv3, use a model directory whose `hydra.yaml` selects the matching
+DINOv3 encoder:
+
+```bash
+hydra.run.dir=plan_outputs/our_dinov3
+ckpt_base_path=/absolute/path/to/DSAIT4030_DINO-WM/our_ckpts
+model_name=our_dinov3
+```
+
+The first DINOv3 run may need to download the encoder weights. Later runs use
+the local model cache.
+
+### Quick smoke test
+
+Use a smoke test only to validate loading and execution:
+
+```bash
+python plan.py --config-name plan_local.yaml \
+  hydra.run.dir=plan_outputs/smoke_test \
+  seed=99 n_evals=1 n_plot_samples=1 \
+  planner.max_iter=1 \
+  planner.sub_planner.num_samples=10 \
+  planner.sub_planner.topk=3 \
+  planner.sub_planner.opt_steps=1 \
+  planner.sub_planner.sample_batch_size=1
+```
+
+Smoke-test results must not be compared with the paper.
+
+## 6. MPC Stopping Rule and Fair Comparisons
+
+The public paper configs set:
+
+```yaml
+planner:
+  max_iter: null
+```
+
+This means MPC keeps replanning until all tasks succeed. The paper reports
+PointMaze MPC success of `0.98`, but it does not clearly document a finite MPC
+round cap. Unlimited retries can make weak checkpoints run for a very long time
+and can inflate eventual success.
+
+For a controlled comparison between checkpoints, set the same finite cap for
+every model, for example:
+
+```bash
+planner.max_iter=2
+```
+
+Report both the stopping rule and success after each MPC round. Do not compare
+an unlimited-retry result for one checkpoint against a fixed-round result for
+another.
+
+### Reuse exactly the same evaluation targets
+
+Every run saves `plan_targets.pkl`. Runs with the same seed and configuration
+should generate the same targets. For the strongest paired comparison, reuse a
+saved target file:
+
+```bash
+goal_source=file \
++goal_file_path=/absolute/path/to/reference_run/plan_targets.pkl
+```
+
+This removes any ambiguity about sampled start/goal pairs.
+
+## 7. Output Files and Metrics
+
+Each run directory contains:
+
+```text
+plan_targets.pkl
+logs.json
+runtime_metrics.json
+runtime_metrics.csv
+plan0.png, plan1.png, ...
+plan0_*.mp4, plan1_*.mp4, ...
+output_final.png
+output_final_*.mp4
+.hydra/config.yaml
+.hydra/overrides.yaml
+```
+
+Important metrics in `logs.json`:
 
 | Metric | Meaning |
-|--------|---------|
-| `success_rate` | Fraction of episodes where robot reached within 0.5 units of goal |
-| `mean_state_dist` | Average final distance to goal state |
-| `mean_visual_dist` | Average visual embedding distance to goal observation |
+|---|---|
+| `success_rate` | Fraction of tasks satisfying the environment success rule |
+| `mean_state_dist` | Mean final state distance to the goal |
+| `mean_visual_dist` | Mean pixel-space distance to the goal observation |
+| `mean_proprio_dist` | Mean proprioceptive distance to the goal |
+| `mean_div_visual_emb` | Difference between predicted and realized visual embeddings |
+| `mean_div_proprio_emb` | Difference between predicted and realized proprio embeddings |
 
----
+For PointMaze, success means the agent is within 0.5 position units of the
+goal. A success rate of `0.96` over 50 tasks means 48 succeeded and 2 failed.
 
-## 6. Timing (on RTX 5070 Laptop 8 GB)
+Official checkpoints with a decoder produce imagined-versus-real
+visualizations. Custom checkpoints without a decoder produce videos of the
+real environment rollout beside the goal frame.
 
-| Config | Episodes | Time |
-|--------|----------|------|
-| `num_samples=100`, `opt_steps=5` | 3 | ~2 min 11 s |
-| `num_samples=300`, `opt_steps=10` (paper config) | 3 | ~6 min (estimated) |
-| `num_samples=300`, `opt_steps=10` (paper config) | 50 | ~1–2 hours (estimated) |
+## 8. Runtime Measurements
+
+Every new run automatically saves runtime measurements in:
+
+```text
+runtime_metrics.json
+runtime_metrics.csv
+```
+
+The measurements are:
+
+- **Inference:** one dynamics-predictor forward pass for one prediction step,
+  batch size 32. Five warm-up runs and 20 measured runs are used.
+- **Simulation rollout:** one simulator action step, batch size 1, excluding
+  environment reset. One warm-up and three measured runs are used.
+- **Planning:** CEM optimization time for each MPC iteration, excluding
+  simulator evaluation, metric calculation, plotting, and video generation.
+  Both total time and time per evaluation task are recorded.
+
+CUDA is synchronized around GPU measurements.
+
+### Paper Table 10 reference
+
+| Metric | Paper time (s) |
+|---|---:|
+| Inference, batch 32 | 0.014 |
+| Simulation rollout, batch 1 | 3.0 |
+| Planning, CEM 100 samples x 10 steps | 53.0 |
+
+For a planning-time workload matching Table 10, run a separate benchmark with:
+
+```bash
+n_evals=1 \
+planner.max_iter=1 \
+planner.sub_planner.num_samples=100 \
+planner.sub_planner.topk=30 \
+planner.sub_planner.opt_steps=10
+```
+
+The PointMaze result configuration uses `300 x 10`, so its planning time is not
+directly comparable to the paper's `100 x 10` timing. Hardware, CUDA version,
+encoder implementation, rendering backend, and CEM memory batch size must also
+be reported with timing results.
+
+## 9. PushT Changes
+
+The same planning code supports PushT, but the checkpoint, dataset, goals,
+objective, and CEM settings must be changed together.
+
+PushT uses its own simulator rather than the PointMaze MuJoCo environment.
+`MUJOCO_PY_FORCE_CPU` is therefore only relevant to PointMaze, while `DISPLAY`
+may still be required for PushT rendering.
+
+### PushT paper parameters
+
+| Parameter | PushT configuration |
+|---|---:|
+| Seed | 99 |
+| Evaluation tasks | 50 |
+| Goal source | `dset` |
+| Goal horizon | 5 |
+| Planner | MPC with CEM |
+| Planning horizon | 5 |
+| Actions executed per MPC round | 5 |
+| CEM samples | 300 |
+| CEM top-k | 30 |
+| CEM optimization steps | 30 |
+| Objective alpha | 1 |
+| Objective mode | `last` |
+
+The important differences from PointMaze are:
+
+- PushT uses goals sampled from dataset trajectories.
+- PushT uses `objective.alpha=1`.
+- PushT uses 30 CEM optimization steps instead of 10.
+- A PushT-trained checkpoint and its matching `hydra.yaml` are mandatory.
+- The PushT dataset must exist at the path referenced by that `hydra.yaml`,
+  normally `$DATASET_DIR/pusht_noise`.
+
+### PushT local command
+
+Use `plan_local.yaml` with PushT overrides:
+
+```bash
+python plan.py --config-name plan_local.yaml \
+  hydra.run.dir=plan_outputs/pusht_pretrained \
+  ckpt_base_path=/absolute/path/to/checkpoint_root \
+  model_name=pusht \
+  seed=99 \
+  n_evals=50 \
+  goal_source=dset \
+  goal_H=5 \
+  n_plot_samples=10 \
+  objective.alpha=1 \
+  objective.mode=last \
+  planner.n_taken_actions=5 \
+  planner.sub_planner.horizon=5 \
+  planner.sub_planner.num_samples=300 \
+  planner.sub_planner.topk=30 \
+  planner.sub_planner.opt_steps=30 \
+  planner.sub_planner.sample_batch_size=10
+```
+
+For a custom PushT checkpoint, change `model_name` to its output-directory
+name. Its training config must identify `env.name: pusht` and the corresponding
+PushT dataset and encoder.
+
+PushT's 30 optimization steps make it roughly three times heavier than the
+PointMaze `300 x 10` CEM workload. Start with a one-task smoke test. If GPU
+memory is insufficient, reduce only `sample_batch_size` first. Reducing
+`num_samples` or `opt_steps` changes the scientific evaluation protocol.
+
+## 10. What to Record in a Results Table
+
+For every checkpoint, record:
+
+- Environment and checkpoint name.
+- Visual encoder version.
+- Seed and target-file identity.
+- Number of evaluation tasks.
+- Goal source and goal horizon.
+- MPC stopping rule or round count.
+- CEM samples, top-k, optimization steps, and planning horizon.
+- Success rate after each MPC round.
+- Final distance metrics.
+- Inference, simulation, and planning times.
+- GPU model, memory, CUDA/PyTorch versions, and CEM memory batch size.
+- Number and location of saved videos.
+
+Only compare checkpoints when environment, target tasks, planner parameters,
+and stopping rules are identical.
