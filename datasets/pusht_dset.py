@@ -1,14 +1,11 @@
 import torch
-import decord
+#import decord
 import pickle
 import numpy as np
 from pathlib import Path
-from einops import rearrange
-from decord import VideoReader
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, TrajSlicerDataset
-from typing import Optional, Callable, Any
-decord.bridge.set_bridge("torch")
+# decord.bridge.set_bridge("torch")
 
 # precomputed dataset stats
 ACTION_MEAN = torch.tensor([-0.0087, 0.0068])
@@ -28,17 +25,19 @@ class PushTDataset(TrajDataset):
         relative=True,
         action_scale=100.0,
         with_velocity: bool = True, # agent's velocity
+        embedding_dir: Optional[str] = None,
     ):  
         self.data_path = Path(data_path)
         self.transform = transform
         self.relative = relative
         self.normalize_action = normalize_action
-        self.states = torch.load(self.data_path / "states.pth")
+        self.embedding_dir = Path(embedding_dir) if embedding_dir is not None else self.data_path
+        self.states = torch.load(self.data_path / "states.pth", weights_only=False)
         self.states = self.states.float()
         if relative:
-            self.actions = torch.load(self.data_path / "rel_actions.pth")
+            self.actions = torch.load(self.data_path / "rel_actions.pth", weights_only=False)
         else:
-            self.actions = torch.load(self.data_path / "abs_actions.pth")
+            self.actions = torch.load(self.data_path / "abs_actions.pth", weights_only=False)
         self.actions = self.actions.float()
         self.actions = self.actions / action_scale  # scaled back up in env
 
@@ -67,7 +66,7 @@ class PushTDataset(TrajDataset):
         # load velocities and update states and proprios
         self.with_velocity = with_velocity
         if with_velocity:
-            self.velocities = torch.load(self.data_path / "velocities.pth")
+            self.velocities = torch.load(self.data_path / "velocities.pth", weights_only=False)
             self.velocities = self.velocities[:n].float()
             self.states = torch.cat([self.states, self.velocities], dim=-1)
             self.proprios = torch.cat([self.proprios, self.velocities], dim=-1)
@@ -76,6 +75,15 @@ class PushTDataset(TrajDataset):
         self.action_dim = self.actions.shape[-1]
         self.state_dim = self.states.shape[-1]
         self.proprio_dim = self.proprios.shape[-1]
+        self.visual_is_embedding = True
+
+        sample_embedding = self._load_episode_embeddings(0)
+        if sample_embedding.ndim != 3:
+            raise ValueError(
+                f"Expected PushT visual embeddings with shape (T, P, D), got {tuple(sample_embedding.shape)}"
+            )
+        self.num_patches = sample_embedding.shape[1]
+        self.visual_emb_dim = sample_embedding.shape[2]
 
         if normalize_action:
             self.action_mean = ACTION_MEAN
@@ -105,20 +113,28 @@ class PushTDataset(TrajDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    def _load_episode_embeddings(self, idx):
+        emb_path = self.embedding_dir / f"patched_ep{idx:05d}.pt"
+        emb = torch.load(emb_path, weights_only=False).float()
+        return emb
+
     def get_frames(self, idx, frames):
-        vid_dir = self.data_path / "obses"
-        reader = VideoReader(str(vid_dir / f"episode_{idx:03d}.mp4"), num_threads=1)
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
         proprio = self.proprios[idx, frames]
         shape = self.shapes[idx]
 
-        image = reader.get_batch(frames)  # THWC
-        image = image / 255.0
-        image = rearrange(image, "T H W C -> T C H W")
-        if self.transform:
-            image = self.transform(image)
-        obs = {"visual": image, "proprio": proprio}
+        visual = self._load_episode_embeddings(idx)
+
+        # --- NEW LAZY FIX ---
+        # Clamp requested frames so they never exceed the actual visual length
+        # If the physics asks for frame 93 but video stops at 92, this safely repeats frame 92.
+        frames_tensor = torch.tensor(frames, dtype=torch.long)
+        frames_tensor = torch.clamp(frames_tensor, max=visual.shape[0] - 1)
+        visual = visual[frames_tensor]
+        # --------------------
+        
+        obs = {"visual": visual, "proprio": proprio}
         return obs, act, state, {'shape': shape}
 
     def __getitem__(self, idx):
@@ -131,7 +147,7 @@ class PushTDataset(TrajDataset):
         if isinstance(imgs, np.ndarray):
             raise NotImplementedError
         elif isinstance(imgs, torch.Tensor):
-            return rearrange(imgs, "b h w c -> b c h w") / 255.0
+            return imgs.float()
 
 
 def load_pusht_slice_train_val(
@@ -144,6 +160,7 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    embedding_dir=None,
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -151,6 +168,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/train",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        embedding_dir=f"{embedding_dir}/train" if embedding_dir is not None else None,
     )
     val_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -158,6 +176,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/val",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        embedding_dir=f"{embedding_dir}/val" if embedding_dir is not None else None,
     )
 
     num_frames = num_hist + num_pred
