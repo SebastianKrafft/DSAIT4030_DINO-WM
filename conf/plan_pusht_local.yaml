@@ -24,8 +24,6 @@ objective:
   base: 2
   mode: last
 
-
-  yaml:
 planner:
   _target_: planning.mpc.MPCPlanner
   max_iter: 60
