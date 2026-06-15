@@ -6,7 +6,7 @@ hydra:
   run:
     dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
 
-ckpt_base_path: /home/sebas/projects/dino_wm
+ckpt_base_path: /kaggle/input/PushT_Checkpoint
 model_name: pusht_ours
 model_epoch: latest
 
