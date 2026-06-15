@@ -6,7 +6,7 @@ hydra:
   run:
     dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
 
-ckpt_base_path: /kaggle/input/PushT_Checkpoint
+ckpt_base_path: /kaggle/input/datasets/sebastiankrafft/pusht-checkpoint
 model_name: pusht_ours
 model_epoch: latest
 
@@ -24,6 +24,8 @@ objective:
   base: 2
   mode: last
 
+
+  yaml:
 planner:
   _target_: planning.mpc.MPCPlanner
   max_iter: 60
