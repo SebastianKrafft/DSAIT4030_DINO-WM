@@ -144,6 +144,7 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    embedding_dir=None,
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
