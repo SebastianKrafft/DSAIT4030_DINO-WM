@@ -6,7 +6,7 @@ hydra:
   run:
     dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
 
-ckpt_base_path: /kaggle/input/datasets/sebastiankrafft/pusht-checkpoint
+ckpt_base_path: /kaggle/input/pusht-checkpoint
 model_name: pusht_ours
 model_epoch: latest
 
