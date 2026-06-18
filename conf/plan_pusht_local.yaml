@@ -6,7 +6,7 @@ hydra:
   run:
     dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
 
-ckpt_base_path: /kaggle/input/pusht-checkpoint
+ckpt_base_path: /add/your/checkpoint/path/here
 model_name: pusht_ours
 model_epoch: latest
 
@@ -33,7 +33,7 @@ planner:
     horizon: 5
     topk: 30
     num_samples: 300
-    sample_batch_size: 30
+    sample_batch_size: 100
     var_scale: 1
     opt_steps: 30
     eval_every: 1
