@@ -1,176 +1,101 @@
-# **DINO-WM**: World Models on Pre-trained Visual Features enable Zero-shot Planning
-[[Paper]](https://arxiv.org/abs/2411.04983) [[Code]]() [[Data]](https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28) [[Project Website]](https://dino-wm.github.io/) 
+# DINO-WM: World Models on Pre-trained Visual Features (Reproduction & Extension)
 
-[Gaoyue Zhou](https://gaoyuezhou.github.io/), [Hengkai Pan](https://hengkaipan.github.io/), [Yann LeCun](https://yann.lecun.com/) and [Lerrel Pinto](https://www.lerrelpinto.com/), New York University, Meta AI
+This repository contains a streamlined and extended implementation of DINO-WM. Due to compute constraints, this project explicitly focuses on evaluating and comparing **DINOv2** and **DINOv3** visual encoders for zero-shot planning in the **PointMaze** and **Push-T** environments.
 
-![teaser_figure](assets/intro.png)
+## 1. Repository Structure
 
-# Getting Started
+This codebase has been deliberately pruned to focus only on the environments and architectures evaluated in our report. 
 
-1. [Installation](#installation)
-2. [Datasets](#datasets)
-3. [Train a DINO-WM](#train-a-dino-wm)
-4. [Plan with a DINO-WM](#plan-with-a-dino-wm)
+* `datasets/`: Data loading pipelines for PointMaze and Push-T.
+* `env/`: Environment wrappers and simulator logic.
+* `models/`: The core architectures (Frozen DINOv2/DINOv3 encoders, ViT transition model, and Transposed CNN decoder).
+* `planning/`: MPC and Cross-Entropy Method (CEM) logic for zero-shot visual planning.
+* `plan.py`: The primary entry point for running inference and generating evaluation videos.
+* `conf/`: Hydra configuration files dictating architecture, dataset paths, and planning hyperparameters.
 
-## Installation
+## 2. Installation
 
-Setup an environment
+Set up the Conda environment:
 ```bash
-git clone https://github.com/gaoyuezhou/dino_wm.git
-cd dino_wm
 conda env create -f environment.yaml
 conda activate dino_wm
 ```
 
-### Install Mujoco
-                    
-Create the `.mujoco` directory and download Mujoco210 using `wget`:
-
+Install Mujoco (Required for PointMaze)
+Create a .mujoco directory and download Mujoco210:
 ```bash
 mkdir -p ~/.mujoco
-wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -P ~/.mujoco/
-cd ~/.mujoco
-tar -xzvf mujoco210-linux-x86_64.tar.gz
+wget [https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz](https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz) -O mujoco.tar.gz
+tar -xf mujoco.tar.gz -C ~/.mujoco
+rm mujoco.tar.gz
 ```
-
-Append the following lines to your `~/.bashrc`:
-
+Ensure you add the Mujoco path to your system variables (e.g., in ~/.bashrc):
 ```bash
-# Mujoco Path. Replace `<username>` with your actual username if necessary.
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/<username>/.mujoco/mujoco210/bin
 
-# NVIDIA Library Path (if using NVIDIA GPUs)
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 ```
 
-Reload your shell configuration to apply the environment variable changes:
+## 3. Pre-Trained Checkpoints
+Because training requires significant GPU compute hours, we have provided our final trained world model weights.
+
+👉 Download Final Checkpoints (Google Drive): https://drive.google.com/drive/folders/1VaRqrkcHoplGAcE00edPJeMlyqpmbbLM?usp=drive_link
+
+Download and extract this folder into the root directory of this repository. Do not alter the folder structure inside, as the Hydra configuration relies on this exact layout to align the architecture configs (hydra.yaml) with the weights (model_latest.pth).
+
+Your project root should look like this:
 
 ```bash
-source ~/.bashrc
+DSAIT4030_DINO-WM/
+├── final_checkpoints/
+│   └── outputs/
+│       ├── pointmaze_dinov2/
+│       ├── pointmaze_dinov3/
+│       ├── pointmaze_dinov3_repeat4/
+│       └── pusht_dinov2/
+└── plan.py
 ```
 
-#### Notes
-- For GPU-accelerated simulations, ensure the NVIDIA drivers are correctly installed.
-- If you encounter issues, confirm that the paths in your `LD_LIBRARY_PATH` are correct.
-- If problems persist, refer to these GitHub issue pages for potential solutions: [openai/mujoco-py#773](https://github.com/openai/mujoco-py/issues/773), [ethz-asl/reinmav-gym#35](https://github.com/ethz-asl/reinmav-gym/issues/35).
+## 4. Running Inference (Planning)
+Planning uses Model Predictive Control (MPC) with the Cross-Entropy Method (CEM) to optimize action sequences in the latent space. Precomputed embeddings are not required for online planning; the script will automatically instantiate the frozen visual encoder to process observations in real-time.
 
+To launch planning, run the following commands from the repository root:
 
-The following are optional installation steps for planning in the deformable environments.
+PointMaze Inference (Example: DINOv3)
+This setup runs 50 evaluation tasks using random_state goals, with 300 CEM samples and 10 optimization steps per task.
 
-### Install PyFlex (optional for deformable environments)
-
-Install PyFleX if you need to plan within the deformable environments. These installation instructions are adapted from [AdaptiGraph](https://github.com/Boey-li/AdaptiGraph/tree/main).
-
-We are using a docker image to compile PyFleX. Make sure you have the following packages:
-- [docker-ce](https://docs.docker.com/engine/install/ubuntu/)
-- [nvidia-docker](https://github.com/NVIDIA/nvidia-docker#quickstart)
-
-Full installation:
 ```bash
-pip install "pybind11[global]"
-sudo docker pull xingyu/softgym
+python plan.py --config-name plan_local.yaml \
+  ckpt_base_path=./final_checkpoints \
+  env.dataset.data_path=./data/pointmaze \
+  model_name=pointmaze_dinov3 \
+  seed=99 n_evals=50 goal_source=random_state goal_H=5 \
+  n_plot_samples=10 objective.alpha=0 objective.mode=last \
+  planner.n_taken_actions=5 \
+  planner.sub_planner.horizon=5 \
+  planner.sub_planner.num_samples=300 \
+  planner.sub_planner.topk=30 \
+  planner.sub_planner.opt_steps=10 \
+  planner.sub_planner.sample_batch_size=10
 ```
-Run `bash install_pyflex.sh`. You may need to `source ~/.bashrc` to `import PyFleX`.
+Push-T Inference (Example: DINOv2)
+Push-T requires heavier optimization. This setup uses dataset-sampled goals (goal_source=dset), shifts the objective alpha to 1, and increases CEM optimization steps to 30.
 
-Or you can manually run
+Note: If GPU memory is insufficient, reduce planner.sub_planner.sample_batch_size before altering the core samples or opt_steps.
 ```bash
-# compile pyflex in docker image
-# re-compile if source code changed
-# make sure ${PWD}/PyFleX is the pyflex root path when re-compiling
-sudo docker run \
-    -v ${PWD}/PyFleX:/workspace/PyFleX \
-    -v ${CONDA_PREFIX}:/workspace/anaconda \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    --gpus all \
-    -e DISPLAY=$DISPLAY \
-    -e QT_X11_NO_MITSHM=1 \
-    -it xingyu/softgym:latest bash \
-    -c "export PATH=/workspace/anaconda/bin:$PATH; cd /workspace/PyFleX; export PYFLEXROOT=/workspace/PyFleX; export PYTHONPATH=/workspace/PyFleX/bindings/build:$PYTHONPATH; export LD_LIBRARY_PATH=$PYFLEXROOT/external/SDL2-2.0.4/lib/x64:$LD_LIBRARY_PATH; cd bindings; mkdir build; cd build; /usr/bin/cmake ..; make -j"
-
-# import to system paths. run these if you do not have these paths yet in ~/.bashrc
-echo '# PyFleX' >> ~/.bashrc
-echo "export PYFLEXROOT=${PWD}/PyFleX" >> ~/.bashrc
-echo 'export PYTHONPATH=${PYFLEXROOT}/bindings/build:$PYTHONPATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=${PYFLEXROOT}/external/SDL2-2.0.4/lib/x64:$LD_LIBRARY_PATH' >> ~/.bashrc
-echo '' >> ~/.bashrc
+python plan.py --config-name plan_local.yaml \
+  ckpt_base_path=./final_checkpoints \
+  env.dataset.data_path=./data/pusht \
+  model_name=pusht_dinov2 \
+  seed=99 n_evals=50 goal_source=dset goal_H=5 \
+  n_plot_samples=10 objective.alpha=1 objective.mode=last \
+  planner.n_taken_actions=5 \
+  planner.sub_planner.horizon=5 \
+  planner.sub_planner.num_samples=300 \
+  planner.sub_planner.topk=30 \
+  planner.sub_planner.opt_steps=30 \
+  planner.sub_planner.sample_batch_size=10
 ```
 
-# Datasets
-
-Dataset for each task can be downloaded [here](https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28). 
-
-Once the datasets are downloaded, unzip them. For the deformable dataset, you need to combine all parts and then unzip:
-```
-zip -s- deformable.zip -O deformable_full.zip
-unzip deformable_full.zip
-```
-
-Set an environment variable pointing to your dataset folder:
-```bash
-# Replace /path/to/data with the actual path to your dataset folder.
-export DATASET_DIR=/path/to/data
-```
-Inside the dataset folder, you should find the following structure:
-```
-data
-├── deformable
-│   ├── granular
-│   └── rope
-├── point_maze
-├── pusht_noise
-└── wall_single
-```
-
-
-# Train a DINO-WM
-Once you have completed the above steps, you can check whether you could launch training with an example command like this:
-
-```
-python train.py --config-name train.yaml env=point_maze frameskip=5 num_hist=3
-```
-You may specify models' output directory at `ckpt_base_path` in `conf/train.yaml`.
-
-# Plan with a DINO-WM
-Once a world model has been trained, you may use it for planning with an example command like this:
-
-```
-python plan.py model_name=<model_name> n_evals=5 planner=cem goal_H=5 goal_source='random_state' planner.opt_steps=30
-```
-
-where the model is saved at folder `<ckpt_base_path>/outputs/<model_name>`, and `<ckpt_base_path>` can be specified in `conf/plan.yaml`.
-
-<!-- ## Acknowledgement
-TODO -->
-
-# Pre-trained Model Checkpoints
-
-We have uploaded our trained world model checkpoints for PointMaze, PushT, and Wall [here](https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28) under `checkpoints`. You can launch planning jobs with their respective configs in the repo:
-
-First, update `ckpt_base_path` to where the checkpoints are saved in the plan configs.
-
-Then launch planning runs with the following commands:
-```bash
-# PointMaze
-python plan.py --config-name plan_point_maze.yaml model_name=point_maze
-# PushT
-python plan.py --config-name plan_pusht.yaml model_name=pusht
-# Wall
-python plan.py --config-name plan_wall.yaml model_name=wall
-```
-
-Planning logs and visualizations can be found in `./plan_outputs`.
-
-
-## Citation
-
-```
-@misc{zhou2024dinowmworldmodelspretrained,
-      title={DINO-WM: World Models on Pre-trained Visual Features enable Zero-shot Planning}, 
-      author={Gaoyue Zhou and Hengkai Pan and Yann LeCun and Lerrel Pinto},
-      year={2024},
-      eprint={2411.04983},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2411.04983}, 
-}
-```
+Evaluation Outputs
+Planning logs, quantitative metrics (Success Rate, Final Distance), and visualization videos (.mp4 or .gif) are automatically saved to dynamically generated timestamped folders in the ./plan_outputs/ directory.
