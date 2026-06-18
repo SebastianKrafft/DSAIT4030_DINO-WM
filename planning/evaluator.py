@@ -83,6 +83,7 @@ class PlanEvaluator:  # evaluator for planning
                 result[i, int(length[i]) :] = 0
         return result
 
+    @torch.inference_mode()
     def eval_actions(
         self, actions, action_len=None, filename="output", save_video=False
     ):
@@ -129,17 +130,40 @@ class PlanEvaluator:  # evaluator for planning
 
         # plot trajs
         if self.wm.decoder is not None:
-            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+            plot_count = min(self.n_plot_samples, n_evals)
+            plot_z_obses = {
+                key: value[:plot_count] for key, value in i_z_obses.items()
+            }
+            i_visuals = self.wm.decode_obs(plot_z_obses)[0]["visual"]
             i_visuals = self._mask_traj(
-                i_visuals, action_len + 1
+                i_visuals, action_len[:plot_count] + 1
             )  # we have action_len + 1 states
-            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
-            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+            e_visuals = self.preprocessor.transform_obs_visual(
+                e_visuals[:plot_count]
+            )
+            e_visuals = self._mask_traj(
+                e_visuals,
+                action_len[:plot_count] * self.frameskip + 1,
+            )
             self._plot_rollout_compare(
                 e_visuals=e_visuals,
                 i_visuals=i_visuals,
-                successes=successes,
+                successes=successes[:plot_count],
                 save_video=save_video,
+                filename=filename,
+            )
+        elif save_video:
+            plot_count = min(self.n_plot_samples, n_evals)
+            e_visuals = self.preprocessor.transform_obs_visual(
+                e_visuals[:plot_count]
+            )
+            e_visuals = self._mask_traj(
+                e_visuals,
+                action_len[:plot_count] * self.frameskip + 1,
+            )
+            self._plot_env_rollout(
+                e_visuals=e_visuals,
+                successes=successes[:plot_count],
                 filename=filename,
             )
 
@@ -184,6 +208,37 @@ class PlanEvaluator:  # evaluator for planning
         })
 
         return logs, successes
+
+    def _plot_env_rollout(self, e_visuals, successes, filename):
+        goal_visual = self.obs_g["visual"][: e_visuals.shape[0]]
+        goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
+
+        for idx in range(e_visuals.shape[0]):
+            success_tag = "success" if successes[idx] else "failure"
+            video_writer = imageio.get_writer(
+                f"{filename}_{idx}_{success_tag}.mp4",
+                fps=12,
+            )
+            for e_obs in e_visuals[idx]:
+                frame = torch.cat([e_obs.cpu(), goal_visual[idx, 0].cpu()], dim=2)
+                frame = rearrange(frame, "c h w -> h w c").numpy()
+                frame = frame * 2 - 1 if frame.min() >= 0 else frame
+                video_writer.append_data(
+                    (((np.clip(frame, -1, 1) + 1) / 2) * 255).astype(np.uint8)
+                )
+            video_writer.close()
+
+        e_visuals = e_visuals[:, :: self.frameskip]
+        e_visuals = torch.cat([e_visuals.cpu(), goal_visual.cpu()], dim=1)
+        n_columns = e_visuals.shape[1]
+        imgs = rearrange(e_visuals, "b t c h w -> (b t) c h w")
+        utils.save_image(
+            imgs,
+            f"{filename}.png",
+            nrow=n_columns,
+            normalize=True,
+            value_range=(-1, 1),
+        )
 
     def _plot_rollout_compare(
         self, e_visuals, i_visuals, successes, save_video=False, filename=""

@@ -1,6 +1,9 @@
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gym
 import json
+import time
 import hydra
 import random
 import torch
@@ -118,6 +121,8 @@ class PlanWorkspace:
         env_name: str,
         frameskip: int,
         wandb_run: wandb.run,
+        env_args=None,
+        env_kwargs=None,
     ):
         self.cfg_dict = cfg_dict
         self.wm = wm
@@ -126,7 +131,10 @@ class PlanWorkspace:
         self.env_name = env_name
         self.frameskip = frameskip
         self.wandb_run = wandb_run
+        self.env_args = env_args or []
+        self.env_kwargs = env_kwargs or {}
         self.device = next(wm.parameters()).device
+        self.benchmark_env_info = None
 
         # have different seeds for each planning instances
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
@@ -196,6 +204,7 @@ class PlanWorkspace:
             self.planner.horizon = cfg_dict["goal_H"]
 
         self.dump_targets()
+        self.runtime_metrics = self._benchmark_runtime()
 
     def prepare_targets(self):
         states = []
@@ -207,6 +216,7 @@ class PlanWorkspace:
             observations, states, actions, env_info = (
                 self.sample_traj_segment_from_dset(traj_len=2)
             )
+            self.benchmark_env_info = env_info[0]
             self.env.update_env(env_info)
 
             # sample random states
@@ -234,6 +244,7 @@ class PlanWorkspace:
             observations, states, actions, env_info = (
                 self.sample_traj_segment_from_dset(traj_len=self.frameskip * self.goal_H + 1)
             )
+            self.benchmark_env_info = env_info[0]
             self.env.update_env(env_info)
 
             # get states from val trajs
@@ -322,6 +333,151 @@ class PlanWorkspace:
         file_path = os.path.abspath("plan_targets.pkl")
         print(f"Dumped plan targets to {file_path}")
 
+    def _synchronize_device(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()
+    def _benchmark_inference(self, batch_size=32, warmup=5, repeats=20):
+        obs = {
+            key: value[:1]
+            for key, value in self.data_preprocessor.transform_obs(
+                {
+                    key: value[:1]
+                    for key, value in self.obs_0.items()
+                }
+            ).items()
+        }
+        obs = {
+            key: value.repeat(batch_size, *([1] * (value.ndim - 1))).to(self.device)
+            for key, value in obs.items()
+        }
+        actions = torch.zeros(
+            batch_size,
+            obs["visual"].shape[1],
+            self.action_dim,
+            device=self.device,
+        )
+        z = self.wm.encode(obs, actions)
+
+        for _ in range(warmup):
+            self.wm.predict(z)
+        self._synchronize_device()
+
+        durations = []
+        for _ in range(repeats):
+            self._synchronize_device()
+            start = time.perf_counter()
+            self.wm.predict(z)
+            self._synchronize_device()
+            durations.append(time.perf_counter() - start)
+
+        return {
+            "mean_seconds": float(np.mean(durations)),
+            "std_seconds": float(np.std(durations)),
+            "batch_size": batch_size,
+            "warmup_runs": warmup,
+            "measured_runs": repeats,
+            "definition": "one dynamics predictor forward pass for one step",
+        }
+
+    def _benchmark_simulation(self, warmup=1, repeats=3):
+        if self.benchmark_env_info is None:
+            return {
+                "available": False,
+                "reason": "environment metadata unavailable for file-based goals",
+            }
+
+        benchmark_env = gym.make(
+            self.env_name,
+            *self.env_args,
+            **self.env_kwargs,
+        )
+        try:
+            benchmark_env.update_env(self.benchmark_env_info)
+            normalized_action = torch.zeros(1, 1, self.dset.action_dim)
+            action = self.data_preprocessor.denormalize_actions(
+                normalized_action
+            ).numpy()[0]
+
+            for _ in range(warmup):
+                benchmark_env.prepare(self.eval_seed[0], self.state_0[0])
+                benchmark_env.step_multiple(action)
+
+            durations = []
+            for _ in range(repeats):
+                benchmark_env.prepare(self.eval_seed[0], self.state_0[0])
+                start = time.perf_counter()
+                benchmark_env.step_multiple(action)
+                durations.append(time.perf_counter() - start)
+        finally:
+            benchmark_env.close()
+
+        return {
+            "available": True,
+            "mean_seconds": float(np.mean(durations)),
+            "std_seconds": float(np.std(durations)),
+            "batch_size": 1,
+            "environment_steps": 1,
+            "warmup_runs": warmup,
+            "measured_runs": repeats,
+            "definition": "one simulator action step, excluding reset",
+        }
+
+    def _benchmark_runtime(self):
+        metrics = {
+            "inference": self._benchmark_inference(),
+            "simulation_rollout": self._benchmark_simulation(),
+            "paper_reference": {
+                "inference_batch_32_seconds": 0.014,
+                "simulation_rollout_batch_1_seconds": 3.0,
+                "planning_cem_100x10_seconds": 53.0,
+            },
+        }
+        print("Runtime benchmark:", json.dumps(metrics, indent=2))
+        return metrics
+
+    def _dump_runtime_metrics(self):
+        planning_timings = getattr(self.planner, "planning_timings", [])
+        self.runtime_metrics["planning"] = {
+            "mpc_iterations": planning_timings,
+            "definition": (
+                "CEM optimization only; excludes environment evaluation, "
+                "metric computation, and video generation"
+            ),
+        }
+
+        with open("runtime_metrics.json", "w") as file:
+            json.dump(self.runtime_metrics, file, indent=2)
+
+        inference = self.runtime_metrics["inference"]
+        simulation = self.runtime_metrics["simulation_rollout"]
+        with open("runtime_metrics.csv", "w") as file:
+            file.write(
+                "metric,time_seconds,batch_size,cem_samples,"
+                "cem_optimization_steps,mpc_iteration\n"
+            )
+            file.write(
+                f"inference,{inference['mean_seconds']},"
+                f"{inference['batch_size']},,,\n"
+            )
+            if simulation.get("available"):
+                file.write(
+                    f"simulation_rollout,{simulation['mean_seconds']},"
+                    f"{simulation['batch_size']},,,\n"
+                )
+            for timing in planning_timings:
+                file.write(
+                    f"planning_per_evaluation,"
+                    f"{timing['seconds_per_evaluation']},1,"
+                    f"{timing['num_samples']},"
+                    f"{timing['optimization_steps']},"
+                    f"{timing['mpc_iteration']}\n"
+                )
+
+        with open(self.log_filename, "a") as file:
+            file.write(json.dumps({"runtime": self.runtime_metrics}) + "\n")
+
     def perform_planning(self):
         if self.debug_dset_init:
             actions_init = self.gt_actions
@@ -347,12 +503,13 @@ class PlanWorkspace:
         }
         with open(self.log_filename, "a") as file:
             file.write(json.dumps(logs_entry) + "\n")
+        self._dump_runtime_metrics()
         return logs
 
 
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device)
+        payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
     for k, v in payload.items():
@@ -487,6 +644,8 @@ def planning_main(cfg_dict):
         env_name=model_cfg.env.name,
         frameskip=model_cfg.frameskip,
         wandb_run=wandb_run,
+        env_args=model_cfg.env.args,
+        env_kwargs=model_cfg.env.kwargs,
     )
 
     logs = plan_workspace.perform_planning()

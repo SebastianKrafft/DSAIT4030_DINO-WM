@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torchvision import transforms
 from einops import rearrange, repeat
 
 class VWorldModel(nn.Module):
@@ -50,6 +51,17 @@ class VWorldModel(nn.Module):
         self.concat_dim = concat_dim # 0 or 1
         assert concat_dim == 0 or concat_dim == 1, f"concat_dim {concat_dim} not supported."
         print("Model emb_dim: ", self.emb_dim)
+
+        if "dino" in self.encoder.name:
+            decoder_scale = 16  # from vqvae
+            num_side_patches = image_size // decoder_scale
+            self.encoder_image_size = num_side_patches * encoder.patch_size
+            self.encoder_transform = transforms.Compose(
+                [transforms.Resize(self.encoder_image_size)]
+            )
+        else:
+            # set self.encoder_transform to identity transform
+            self.encoder_transform = lambda x: x
 
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
@@ -107,15 +119,15 @@ class VWorldModel(nn.Module):
 
     def encode_obs(self, obs):
         """
-        input : obs (dict): "visual", "proprio" where "visual" is already in embedding
-                            space with shape (b, t, num_patches, encoder_emb_dim)
+        input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
         output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
         """
-        visual_embs = obs['visual'].float()
-        if visual_embs.ndim != 4:
-            raise ValueError(
-                f"Expected embedded point-maze visuals with shape (b, t, p, d), got {tuple(visual_embs.shape)}"
-            )
+        visual = obs['visual']
+        b = visual.shape[0]
+        visual = rearrange(visual, "b t ... -> (b t) ...")
+        visual = self.encoder_transform(visual)
+        visual_embs = self.encoder.forward(visual)
+        visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
 
         proprio = obs['proprio']
         proprio_emb = self.encode_proprio(proprio)

@@ -1,5 +1,8 @@
 from gym.envs.registration import register
-from .pointmaze import U_MAZE
+try:
+    from .pointmaze import U_MAZE
+except Exception:
+    U_MAZE = None
 register(
     id="pusht",
     entry_point="env.pusht.pusht_wrapper:PushTWrapper",
