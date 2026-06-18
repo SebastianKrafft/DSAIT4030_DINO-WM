@@ -36,3 +36,16 @@ class DummyRepeatActionEncoder(nn.Module):
         act_repeated = act.repeat(1, 1, num_repeat)
         processed_act[:, :, :num_repeat * act_dim] = act_repeated
         return processed_act
+
+
+class DummyPatchEncoder(nn.Module):
+    def __init__(self, emb_dim, num_patches, **kwargs):
+        super().__init__()
+        self.name = "dummy_patch"
+        self.latent_ndim = 2
+        self.emb_dim = emb_dim
+        self.num_patches = num_patches
+        self.fc = nn.Linear(1, 1)  # keeps the optimizer plumbing intact
+
+    def forward(self, x):
+        return x

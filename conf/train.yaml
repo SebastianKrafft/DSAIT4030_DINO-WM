@@ -1,12 +1,11 @@
 defaults:
   - _self_
   - env: point_maze
-  - encoder: dino 
+  - encoder: precomputed
   - action_encoder: proprio
   - proprio_encoder: proprio
   - decoder: vqvae
   - predictor: vit
-  - override hydra/launcher: submitit_slurm
 
 # base path to save model outputs. Checkpoints will be saved to ${ckpt_base_path}/outputs.
 ckpt_base_path: ./ # put absolute path here
@@ -17,22 +16,11 @@ hydra:
   sweep:
     dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}
-  launcher:
-    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
-    nodes: 1
-    tasks_per_node: 1
-    cpus_per_task: 8
-    mem_gb: 512
-    gres: "gpu:h100:1"
-    timeout_min: 2880
-    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
-            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
-            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 training:
   seed: 0
   epochs: 100
-  batch_size: 32 # should >= nodes * tasks_per_node
+  batch_size: 64 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -58,7 +46,7 @@ num_proprio_repeat: 1
 num_hist: 3
 num_pred: 1 # only supports 1
 has_predictor: True # set this to False for only training a decoder
-has_decoder: True # set this to False for only training a predictor
+has_decoder: False # point-maze uses precomputed visual embeddings and skips image reconstruction
 
 model:
   _target_: models.visual_world_model.VWorldModel
@@ -67,7 +55,7 @@ model:
   num_pred: ${num_pred}
   train_encoder: False
   train_predictor: True
-  train_decoder: True
+  train_decoder: False
 
 debug: False 
 
@@ -79,3 +67,21 @@ plan_settings:
   goal_source: ['dset', 'random_state']
   goal_H: [5]
   alpha: [0.1, 1]
+
+profiling:
+  # Lightweight epoch metrics are always logged by train.py.
+  # Enable this only for short debug runs; torch.profiler adds overhead and writes traces.
+  torch_profiler: false
+  torch_profiler_epoch: all
+  torch_profiler_dir: profile/torch
+  torch_profiler_skip_first: 0
+  torch_profiler_wait: 8
+  torch_profiler_warmup: 1
+  torch_profiler_active: 5
+  torch_profiler_repeat: 1
+  torch_profiler_record_shapes: true
+  torch_profiler_profile_memory: true
+  torch_profiler_with_stack: false
+  torch_profiler_with_flops: true
+  torch_profiler_row_limit: 20
+
