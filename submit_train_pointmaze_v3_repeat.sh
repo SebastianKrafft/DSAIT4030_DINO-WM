@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=d_v3_a100_w8_4g_64_r0
+#SBATCH --job-name=d_v3_v100_w8_4g_64_r4_trial2
 #SBATCH --account=education-me-msc-ro
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-v100
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/home/%u/dino_wm_logs/dinov3_a100_r0_%j.out
-#SBATCH --error=/home/%u/dino_wm_logs/dinov3_a100_r0_%j.err
+#SBATCH --output=/home/%u/dino_wm_logs/dinov3_v100_r4_%j.out
+#SBATCH --error=/home/%u/dino_wm_logs/dinov3_v100_r4_%j.err
 
 mkdir -p ~/dino_wm_logs
-mkdir -p ~/dino_wm_checkpoints/dino_v3_full_training
+mkdir -p ~/dino_wm_checkpoints/dino_v3_repeat4_a100
 
 echo "=============================="
 echo "Job started: $(date)"
@@ -55,9 +55,11 @@ python train.py \
 	has_decoder=False \
 	training.epochs=100 \
 	training.save_every_x_epoch=100 \
+    	num_proprio_repeat=4 \
+    	num_action_repeat=4 \
 	predictor.use_flash_attention=true \
-	ckpt_base_path=/home/$USER/dino_wm_checkpoints/dino_v3_full_training \
-	hydra.run.dir=/home/$USER/dino_wm_checkpoints/dino_v3_full_training
+	ckpt_base_path=/home/$USER/dino_wm_checkpoints/dino_v3_repeat4_a100 \
+	hydra.run.dir=/home/$USER/dino_wm_checkpoints/dino_v3_repeat4_a100
 
 echo "=============================="
 echo "Job finished: $(date)"
